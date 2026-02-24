@@ -2,7 +2,7 @@ name: Continuous Subdomain Recon with Status Monitoring
 
 on:
   schedule:
-    - cron: "0 */1 * * *"   # Every hour
+    - cron: "0 */2 * * *"   # Every hour
   workflow_dispatch:
 
 concurrency:
@@ -15,7 +15,7 @@ permissions:
 jobs:
   recon:
     runs-on: ubuntu-latest
-    timeout-minutes: 100
+    timeout-minutes: 60
 
     steps:
       - name: Checkout Repository
@@ -36,37 +36,50 @@ jobs:
           sudo mv subfinder /usr/local/bin/
           rm -f subfinder.zip subfinder
 
-          # Install httpx (no Go required)
+          # Install httpx (binary method, no Go required)
           HX_VERSION=$(curl -s https://api.github.com/repos/projectdiscovery/httpx/releases/latest | jq -r '.tag_name' | sed 's/v//')
           curl -sL "https://github.com/projectdiscovery/httpx/releases/download/v${HX_VERSION}/httpx_${HX_VERSION}_linux_amd64.zip" -o httpx.zip
           unzip -o httpx.zip
           sudo mv httpx /usr/local/bin/
           rm -f httpx.zip httpx
 
-      - name: Run Subdomain Discovery (Subfinder + THC)
+      - name: Run Subdomain Discovery (From targets.txt)
         run: |
-          TARGET="nasa.gov"
           mkdir -p sub_recon
+          [ -f sub_recon/all_subs.txt ] || touch sub_recon/all_subs.txt
+          > sub_recon/current_scan.txt
+          > sub_recon/all_sources.txt
 
-          touch sub_recon/all_subs.txt
-          touch sub_recon/all_sources.txt
+          if [ ! -f targets.txt ]; then
+            echo "targets.txt not found!"
+            exit 1
+          fi
 
-          echo "[*] Running Subfinder..."
-          subfinder -d $TARGET -silent > sub_recon/current_scan.txt
+          while read TARGET; do
+            [ -z "$TARGET" ] && continue
 
-          echo "[*] THC /sb..."
-          curl -sf --retry 2 --max-time 20 \
-            "https://ip.thc.org/sb/${TARGET}" \
-            | grep -Eo "([a-zA-Z0-9._-]+\.)+${TARGET}" \
-            >> sub_recon/all_sources.txt || true
+            echo "======================================="
+            echo "[*] Processing $TARGET"
+            echo "======================================="
 
-          echo "[*] THC /cn..."
-          curl -sf --retry 2 --max-time 20 \
-            "https://ip.thc.org/cn/${TARGET}" \
-            | grep -Eo "([a-zA-Z0-9._-]+\.)+${TARGET}" \
-            >> sub_recon/all_sources.txt || true
+            echo "[*] Running Subfinder..."
+            subfinder -d "$TARGET" -silent >> sub_recon/current_scan.txt
 
-          # Merge and deduplicate
+            echo "[*] THC /sb..."
+            curl -sf --retry 1 --connect-timeout 5 --max-time 15 \
+              "https://ip.thc.org/sb/${TARGET}" \
+              | grep -Eo "([a-zA-Z0-9._-]+\.)+${TARGET}" \
+              >> sub_recon/all_sources.txt || true
+
+            echo "[*] THC /cn..."
+            curl -sf --retry 1 --connect-timeout 5 --max-time 15 \
+              "https://ip.thc.org/cn/${TARGET}" \
+              | grep -Eo "([a-zA-Z0-9._-]+\.)+${TARGET}" \
+              >> sub_recon/all_sources.txt || true
+
+          done < targets.txt
+
+          # Merge & deduplicate
           cat sub_recon/all_sources.txt >> sub_recon/current_scan.txt
           sort -u sub_recon/current_scan.txt -o sub_recon/current_scan.txt
 
@@ -92,12 +105,16 @@ jobs:
             echo "new_found=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Probe with httpx (Status + Title)
+      - name: Probe with httpx (Optimized for CI)
         run: |
-          httpx -silent \
+          httpx \
             -l sub_recon/all_subs.txt \
             -status-code \
             -title \
+            -threads 20 \
+            -timeout 8 \
+            -retries 1 \
+            -silent \
             -no-color \
             -o sub_recon/status_current.txt
 
@@ -127,7 +144,7 @@ jobs:
           payload: |
             {
               "channel": "C0A5M7P61N3",
-              "text": "🎯 New subdomains discovered for nasa.gov (Count: ${{ steps.compare.outputs.new_count }})"
+              "text": "🎯 New subdomains discovered across targets.txt (Count: ${{ steps.compare.outputs.new_count }})"
             }
 
       - name: Slack Alert - Status Changes
@@ -139,7 +156,7 @@ jobs:
           payload: |
             {
               "channel": "C0A5M7P61N3",
-              "text": "⚠️ Status code changes detected for nasa.gov!"
+              "text": "⚠️ Status code changes detected across monitored targets!"
             }
 
       - name: Commit and Push Changes
