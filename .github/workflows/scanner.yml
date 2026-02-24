@@ -1,0 +1,94 @@
+name: Continuous Subdomain Recon
+on:
+  schedule:
+    - cron: "0 */1 * * *"  # Every hour
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  recon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Install Subfinder (Binary)
+        run: |
+          LATEST_VERSION=$(curl -s https://api.github.com/repos/projectdiscovery/subfinder/releases/latest | jq -r '.tag_name' | sed 's/v//')
+          curl -sL "https://github.com/projectdiscovery/subfinder/releases/download/v${LATEST_VERSION}/subfinder_${LATEST_VERSION}_linux_amd64.zip" -o subfinder.zip
+          unzip -o subfinder.zip
+          sudo mv subfinder /usr/local/bin/
+          # Clean up download immediately
+          rm -f subfinder.zip subfinder
+
+      - name: Run Subdomain Discovery
+        run: |
+          mkdir -p sub_recon
+          touch sub_recon/all_subs.txt
+          subfinder -d nasa.gov -silent > sub_recon/current_scan.txt
+
+      - name: Compare and Find New Subdomains
+        id: compare
+        run: |
+          if [ ! -s sub_recon/all_subs.txt ]; then
+            echo "IS_FIRST_RUN=true" >> $GITHUB_ENV
+          else
+            echo "IS_FIRST_RUN=false" >> $GITHUB_ENV
+          fi
+
+          # Find new subdomains not in historical list
+          grep -Fvxf sub_recon/all_subs.txt sub_recon/current_scan.txt > sub_recon/new_subs.txt || true
+
+          if [ -s sub_recon/new_subs.txt ]; then
+            COUNT=$(wc -l < sub_recon/new_subs.txt | xargs)
+            echo "new_found=true" >> $GITHUB_OUTPUT
+            echo "new_count=$COUNT" >> $GITHUB_OUTPUT
+
+            # Append new ones and deduplicate
+            cat sub_recon/new_subs.txt >> sub_recon/all_subs.txt
+            sort -u sub_recon/all_subs.txt -o sub_recon/all_subs.txt
+          else
+            echo "new_found=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload New Subs File to Slack
+        if: steps.compare.outputs.new_found == 'true' && env.IS_FIRST_RUN == 'false'
+        uses: slackapi/slack-github-action@v2.1.1
+        with:
+          method: files.uploadV2
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload: |
+            {
+              "channel_id": "C0A5M7P61N3",
+              "initial_comment": "🎯 New subdomains discovered for nasa.gov! (Total: ${{ steps.compare.outputs.new_count }})",
+              "file": "./sub_recon/new_subs.txt",
+              "filename": "new_subdomains.txt"
+            }
+
+      - name: Commit and Push Changes
+        if: steps.compare.outputs.new_found == 'true'
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+
+          git add sub_recon/all_subs.txt
+          git commit -m "Recon Update: $(date +'%Y-%m-%d %H:%M') - Found ${{ steps.compare.outputs.new_count }} new subdomains"
+
+          # Direct push — safe for automated single-contributor workflows
+          git push origin main
+
+      - name: Cleanup Temporary Files (Safety)
+        if: always()
+        run: |
+          rm -f subfinder.zip subfinder
+          rm -f sub_recon/current_scan.txt sub_recon/new_subs.txt
