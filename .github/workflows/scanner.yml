@@ -1,7 +1,8 @@
-name: Continuous Subdomain Recon
+name: Continuous Subdomain Recon with Status Monitoring
+
 on:
   schedule:
-    - cron: "0 */1 * * *"  # Every hour
+    - cron: "0 */1 * * *"   # Every hour
   workflow_dispatch:
 
 concurrency:
@@ -14,7 +15,8 @@ permissions:
 jobs:
   recon:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -22,22 +24,53 @@ jobs:
           persist-credentials: true
           fetch-depth: 0
 
-      - name: Install Subfinder (Binary)
+      - name: Install Dependencies (Subfinder + httpx)
         run: |
-          LATEST_VERSION=$(curl -s https://api.github.com/repos/projectdiscovery/subfinder/releases/latest | jq -r '.tag_name' | sed 's/v//')
-          curl -sL "https://github.com/projectdiscovery/subfinder/releases/download/v${LATEST_VERSION}/subfinder_${LATEST_VERSION}_linux_amd64.zip" -o subfinder.zip
+          sudo apt-get update
+          sudo apt-get install -y jq unzip curl
+
+          # Install Subfinder
+          SF_VERSION=$(curl -s https://api.github.com/repos/projectdiscovery/subfinder/releases/latest | jq -r '.tag_name' | sed 's/v//')
+          curl -sL "https://github.com/projectdiscovery/subfinder/releases/download/v${SF_VERSION}/subfinder_${SF_VERSION}_linux_amd64.zip" -o subfinder.zip
           unzip -o subfinder.zip
           sudo mv subfinder /usr/local/bin/
-          # Clean up download immediately
           rm -f subfinder.zip subfinder
 
-      - name: Run Subdomain Discovery
-        run: |
-          mkdir -p sub_recon
-          touch sub_recon/all_subs.txt
-          subfinder -d nasa.gov -silent > sub_recon/current_scan.txt
+          # Install httpx (no Go required)
+          HX_VERSION=$(curl -s https://api.github.com/repos/projectdiscovery/httpx/releases/latest | jq -r '.tag_name' | sed 's/v//')
+          curl -sL "https://github.com/projectdiscovery/httpx/releases/download/v${HX_VERSION}/httpx_${HX_VERSION}_linux_amd64.zip" -o httpx.zip
+          unzip -o httpx.zip
+          sudo mv httpx /usr/local/bin/
+          rm -f httpx.zip httpx
 
-      - name: Compare and Find New Subdomains
+      - name: Run Subdomain Discovery (Subfinder + THC)
+        run: |
+          TARGET="nasa.gov"
+          mkdir -p sub_recon
+
+          touch sub_recon/all_subs.txt
+          touch sub_recon/all_sources.txt
+
+          echo "[*] Running Subfinder..."
+          subfinder -d $TARGET -silent > sub_recon/current_scan.txt
+
+          echo "[*] THC /sb..."
+          curl -sf --retry 2 --max-time 20 \
+            "https://ip.thc.org/sb/${TARGET}" \
+            | grep -Eo "([a-zA-Z0-9._-]+\.)+${TARGET}" \
+            >> sub_recon/all_sources.txt || true
+
+          echo "[*] THC /cn..."
+          curl -sf --retry 2 --max-time 20 \
+            "https://ip.thc.org/cn/${TARGET}" \
+            | grep -Eo "([a-zA-Z0-9._-]+\.)+${TARGET}" \
+            >> sub_recon/all_sources.txt || true
+
+          # Merge and deduplicate
+          cat sub_recon/all_sources.txt >> sub_recon/current_scan.txt
+          sort -u sub_recon/current_scan.txt -o sub_recon/current_scan.txt
+
+      - name: Compare and Detect New Subdomains
         id: compare
         run: |
           if [ ! -s sub_recon/all_subs.txt ]; then
@@ -46,7 +79,6 @@ jobs:
             echo "IS_FIRST_RUN=false" >> $GITHUB_ENV
           fi
 
-          # Find new subdomains not in historical list
           grep -Fvxf sub_recon/all_subs.txt sub_recon/current_scan.txt > sub_recon/new_subs.txt || true
 
           if [ -s sub_recon/new_subs.txt ]; then
@@ -54,41 +86,74 @@ jobs:
             echo "new_found=true" >> $GITHUB_OUTPUT
             echo "new_count=$COUNT" >> $GITHUB_OUTPUT
 
-            # Append new ones and deduplicate
             cat sub_recon/new_subs.txt >> sub_recon/all_subs.txt
             sort -u sub_recon/all_subs.txt -o sub_recon/all_subs.txt
           else
             echo "new_found=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Upload New Subs File to Slack
+      - name: Probe with httpx (Status + Title)
+        run: |
+          httpx -silent \
+            -l sub_recon/all_subs.txt \
+            -status-code \
+            -title \
+            -no-color \
+            -o sub_recon/status_current.txt
+
+      - name: Detect Status Changes
+        id: statuscheck
+        run: |
+          if [ -f sub_recon/status_previous.txt ]; then
+            grep -Fvxf sub_recon/status_previous.txt sub_recon/status_current.txt > sub_recon/status_changed.txt || true
+          else
+            touch sub_recon/status_changed.txt
+          fi
+
+          if [ -s sub_recon/status_changed.txt ]; then
+            echo "status_changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "status_changed=false" >> $GITHUB_OUTPUT
+          fi
+
+          cp sub_recon/status_current.txt sub_recon/status_previous.txt
+
+      - name: Slack Alert - New Subdomains
         if: steps.compare.outputs.new_found == 'true' && env.IS_FIRST_RUN == 'false'
         uses: slackapi/slack-github-action@v2.1.1
         with:
-          method: files.uploadV2
+          method: chat.postMessage
           token: ${{ secrets.SLACK_BOT_TOKEN }}
           payload: |
             {
-              "channel_id": "C0A5M7P61N3",
-              "initial_comment": "🎯 New subdomains discovered for nasa.gov! (Total: ${{ steps.compare.outputs.new_count }})",
-              "file": "./sub_recon/new_subs.txt",
-              "filename": "new_subdomains.txt"
+              "channel": "C0A5M7P61N3",
+              "text": "🎯 New subdomains discovered for nasa.gov (Count: ${{ steps.compare.outputs.new_count }})"
+            }
+
+      - name: Slack Alert - Status Changes
+        if: steps.statuscheck.outputs.status_changed == 'true'
+        uses: slackapi/slack-github-action@v2.1.1
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload: |
+            {
+              "channel": "C0A5M7P61N3",
+              "text": "⚠️ Status code changes detected for nasa.gov!"
             }
 
       - name: Commit and Push Changes
-        if: steps.compare.outputs.new_found == 'true'
+        if: steps.compare.outputs.new_found == 'true' || steps.statuscheck.outputs.status_changed == 'true'
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
 
-          git add sub_recon/all_subs.txt
-          git commit -m "Recon Update: $(date +'%Y-%m-%d %H:%M') - Found ${{ steps.compare.outputs.new_count }} new subdomains"
-
-          # Direct push — safe for automated single-contributor workflows
+          git add sub_recon/
+          git commit -m "Recon Update: $(date +'%Y-%m-%d %H:%M') - Changes detected" || echo "No changes"
           git push origin main
 
-      - name: Cleanup Temporary Files (Safety)
+      - name: Cleanup
         if: always()
         run: |
           rm -f subfinder.zip subfinder
-          rm -f sub_recon/current_scan.txt sub_recon/new_subs.txt
+          rm -f httpx.zip httpx
