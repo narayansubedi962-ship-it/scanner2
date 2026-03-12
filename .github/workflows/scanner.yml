@@ -2,12 +2,12 @@ name: Continuous Subdomain Recon with Status Monitoring
 
 on:
   schedule:
-    - cron: "0 */2 * * *"   # Every 2 hours
-  workflow_dispatch:
+    - cron: "0 */2 * * *"  # Runs every 2 hours
+  workflow_dispatch:       # Allows manual trigger
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: false # We don't want to kill a running scan; let it finish.
 
 permissions:
   contents: write
@@ -15,7 +15,7 @@ permissions:
 jobs:
   recon:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 360   # Increased to 6 hours to handle large target lists
 
     steps:
       - name: Checkout Repository
@@ -24,180 +24,133 @@ jobs:
           persist-credentials: true
           fetch-depth: 0
 
-      - name: Install Dependencies (Subfinder + httpx)
+      - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq unzip curl
-
+          sudo apt-get install -y jq unzip curl grep diffutils
+          
           # Install Subfinder
           SF_VERSION=$(curl -s https://api.github.com/repos/projectdiscovery/subfinder/releases/latest | jq -r '.tag_name' | sed 's/v//')
           curl -sL "https://github.com/projectdiscovery/subfinder/releases/download/v${SF_VERSION}/subfinder_${SF_VERSION}_linux_amd64.zip" -o subfinder.zip
-          unzip -o subfinder.zip
-          sudo mv subfinder /usr/local/bin/
-          rm -f subfinder.zip subfinder
+          unzip -o subfinder.zip && sudo mv subfinder /usr/local/bin/
 
           # Install httpx
           HX_VERSION=$(curl -s https://api.github.com/repos/projectdiscovery/httpx/releases/latest | jq -r '.tag_name' | sed 's/v//')
           curl -sL "https://github.com/projectdiscovery/httpx/releases/download/v${HX_VERSION}/httpx_${HX_VERSION}_linux_amd64.zip" -o httpx.zip
-          unzip -o httpx.zip
-          sudo mv httpx /usr/local/bin/
-          rm -f httpx.zip httpx
+          unzip -o httpx.zip && sudo mv httpx /usr/local/bin/
+          
+          rm -f *.zip
 
-      - name: Run Subdomain Discovery (From targets.txt)
+      - name: Initialize Files
         run: |
           mkdir -p sub_recon
-          [ -f sub_recon/all_subs.txt ] || touch sub_recon/all_subs.txt
+          touch sub_recon/all_subs.txt
+          touch sub_recon/status_previous.txt
+          [ -f targets.txt ] || { echo "Error: targets.txt not found!"; exit 1; }
+
+      - name: Run Discovery
+        run: |
+          # Clean temp files
           > sub_recon/current_scan.txt
-          > sub_recon/all_sources.txt
-
-          if [ ! -f targets.txt ]; then
-            echo "targets.txt not found!"
-            exit 1
-          fi
-
+          
           fetch_thc() {
             local TYPE=$1
             local TARGET=$2
             local URL="https://ip.thc.org/${TYPE}/${TARGET}?l=100"
-
-            while [ -n "$URL" ]; do
-              echo "[*] Fetching $URL"
-
-              RESPONSE=$(curl -sf --retry 2 --connect-timeout 8 --max-time 20 "$URL") || break
-
-              # Extract subdomains from response
-              echo "$RESPONSE" \
-                | grep -Eo "([a-zA-Z0-9._-]+\.)+${TARGET}" \
-                >> sub_recon/all_sources.txt || true
-
-              # Extract next page if exists
-              NEXT=$(echo "$RESPONSE" | grep ";;Next Page:" | sed 's/;;Next Page:[[:space:]]*//')
-
-              # Extract rate limit value
-              RL=$(echo "$RESPONSE" | grep ";;Rate Limit:" | grep -Eo '[0-9]+' | head -n1)
-
-              # Basic rate limit handling
-              if [ -n "$RL" ] && [ "$RL" -lt 5 ]; then
-                echo "[*] Low rate limit detected. Sleeping 5 seconds..."
-                sleep 5
-              else
-                sleep 1
-              fi
-
-              URL="$NEXT"
+            local PAGES=0
+            
+            while [ -n "$URL" ] && [ "$PAGES" -lt 50 ]; do
+              echo "[*] Fetching THC $TYPE for $TARGET (Page $PAGES)"
+              RESPONSE=$(curl -sf --retry 3 --connect-timeout 10 --max-time 30 "$URL") || break
+              echo "$RESPONSE" | grep -Eo "([a-zA-Z0-9._-]+\.)+${TARGET}" >> sub_recon/current_scan.txt || true
+              URL=$(echo "$RESPONSE" | grep ";;Next Page:" | sed 's/;;Next Page:[[:space:]]*//')
+              PAGES=$((PAGES+1))
+              sleep 2 # Respectful rate limiting
             done
           }
 
-          while read TARGET; do
+          while read -r TARGET; do
             [ -z "$TARGET" ] && continue
-
-            echo "======================================="
-            echo "[*] Processing $TARGET"
-            echo "======================================="
-
-            echo "[*] Running Subfinder..."
-            subfinder -d "$TARGET" -silent >> sub_recon/current_scan.txt
-
-            echo "[*] THC /sb (with pagination)..."
+            echo "--- Scanning: $TARGET ---"
+            subfinder -d "$TARGET" -all -silent >> sub_recon/current_scan.txt
             fetch_thc "sb" "$TARGET"
-
-            echo "[*] THC /cn (with pagination)..."
             fetch_thc "cn" "$TARGET"
-
           done < targets.txt
 
-          # Merge & deduplicate
-          cat sub_recon/all_sources.txt >> sub_recon/current_scan.txt
+          # Deduplicate
           sort -u sub_recon/current_scan.txt -o sub_recon/current_scan.txt
 
-      - name: Compare and Detect New Subdomains
+      - name: Find New Subdomains
         id: compare
         run: |
+          # Check if this is the first run
           if [ ! -s sub_recon/all_subs.txt ]; then
             echo "IS_FIRST_RUN=true" >> $GITHUB_ENV
           else
             echo "IS_FIRST_RUN=false" >> $GITHUB_ENV
           fi
 
+          # Identify what is new
           grep -Fvxf sub_recon/all_subs.txt sub_recon/current_scan.txt > sub_recon/new_subs.txt || true
-
+          
           if [ -s sub_recon/new_subs.txt ]; then
-            COUNT=$(wc -l < sub_recon/new_subs.txt | xargs)
+            COUNT=$(wc -l < sub_recon/new_subs.txt)
             echo "new_found=true" >> $GITHUB_OUTPUT
             echo "new_count=$COUNT" >> $GITHUB_OUTPUT
-
+            # Append new to master list
             cat sub_recon/new_subs.txt >> sub_recon/all_subs.txt
             sort -u sub_recon/all_subs.txt -o sub_recon/all_subs.txt
           else
             echo "new_found=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Probe with httpx (Optimized for CI)
+      - name: Live Status Probe
         run: |
-          httpx \
-            -l sub_recon/all_subs.txt \
-            -status-code \
-            -title \
-            -threads 20 \
-            -timeout 8 \
-            -retries 1 \
-            -silent \
-            -no-color \
+          # Probe ALL known subdomains to see current state
+          httpx -l sub_recon/all_subs.txt \
+            -status-code -title -content-length -web-server \
+            -threads 50 -timeout 10 -silent -no-color \
             -o sub_recon/status_current.txt
 
-      - name: Detect Status Changes
+      - name: Check for Status Changes
         id: statuscheck
         run: |
-          if [ -f sub_recon/status_previous.txt ]; then
-            grep -Fvxf sub_recon/status_previous.txt sub_recon/status_current.txt > sub_recon/status_changed.txt || true
-          else
-            touch sub_recon/status_changed.txt
+          # Compare current status with previous run
+          if [ -s sub_recon/status_previous.txt ]; then
+            grep -Fvxf sub_recon/status_previous.txt sub_recon/status_current.txt > sub_recon/status_changes.txt || true
           fi
 
-          if [ -s sub_recon/status_changed.txt ]; then
+          if [ -s sub_recon/status_changes.txt ]; then
             echo "status_changed=true" >> $GITHUB_OUTPUT
           else
             echo "status_changed=false" >> $GITHUB_OUTPUT
           fi
 
+      - name: Slack Alert (Optional)
+        if: (steps.compare.outputs.new_found == 'true' && env.IS_FIRST_RUN == 'false') || steps.statuscheck.outputs.status_changed == 'true'
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }} # Add this to your Repo Secrets
+        run: |
+          if [ "${{ steps.compare.outputs.new_found }}" == "true" ]; then
+            MSG="🎯 *New Subdomains:* ${{ steps.compare.outputs.new_count }} found."
+          fi
+          if [ "${{ steps.statuscheck.outputs.status_changed }}" == "true" ]; then
+            MSG="$MSG \n⚠️ *Status Changes detected* in your attack surface."
+          fi
+          
+          # Only attempt curl if webhook exists
+          if [ -n "$SLACK_WEBHOOK" ]; then
+            curl -X POST -H 'Content-type: application/json' --data "{\"text\":\"$MSG\"}" $SLACK_WEBHOOK
+          fi
+
+      - name: Commit & Preserve Data
+        run: |
+          git config --local user.email "recon-bot@github.com"
+          git config --local user.name "Recon-Bot"
+          
+          # Swap status files for next run
           cp sub_recon/status_current.txt sub_recon/status_previous.txt
-
-      - name: Slack Alert - New Subdomains
-        if: steps.compare.outputs.new_found == 'true' && env.IS_FIRST_RUN == 'false'
-        uses: slackapi/slack-github-action@v2.1.1
-        with:
-          method: chat.postMessage
-          token: ${{ secrets.SLACK_BOT_TOKEN }}
-          payload: |
-            {
-              "channel": "C0A5M7P61N3",
-              "text": "🎯 New subdomains discovered across targets.txt (Count: ${{ steps.compare.outputs.new_count }})"
-            }
-
-      - name: Slack Alert - Status Changes
-        if: steps.statuscheck.outputs.status_changed == 'true'
-        uses: slackapi/slack-github-action@v2.1.1
-        with:
-          method: chat.postMessage
-          token: ${{ secrets.SLACK_BOT_TOKEN }}
-          payload: |
-            {
-              "channel": "C0A5M7P61N3",
-              "text": "⚠️ Status code changes detected across monitored targets!"
-            }
-
-      - name: Commit and Push Changes
-        if: steps.compare.outputs.new_found == 'true' || steps.statuscheck.outputs.status_changed == 'true'
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-
+          
           git add sub_recon/
-          git commit -m "Recon Update: $(date +'%Y-%m-%d %H:%M') - Changes detected" || echo "No changes"
+          git commit -m "Recon Update: $(date +'%Y-%m-%d %H:%M') [Found: ${{ steps.compare.outputs.new_count || 0 }}]" || echo "No changes to commit"
           git push origin main
-
-      - name: Cleanup
-        if: always()
-        run: |
-          rm -f subfinder.zip subfinder
-          rm -f httpx.zip httpx
